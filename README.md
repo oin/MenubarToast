@@ -42,7 +42,8 @@ Requires macOS and Xcode command-line tools.
 
 # Known Issues
 
-- The toast background uses `NSVisualEffectMaterialMenu` which doesn't perfectly match the menu bar's native translucency. A left-edge fade gradient helps blend the transition, but a slight color difference may be visible on some wallpapers.
+- The toast background color is sampled from the actual menu bar pixels using a deprecated CoreGraphics API (`CGDisplayCreateImageForRect` loaded via `dlsym`). This triggers a brief screen recording indicator dot on the first launch after a wallpaper change. The sampled color is cached across launches so subsequent toasts don't trigger it.
+- On macOS versions where the dynamic symbol is no longer available, the toast falls back to a plain black/white background matching the current appearance.
 
 # Acknowledgements
 

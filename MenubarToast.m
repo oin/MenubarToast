@@ -4,6 +4,7 @@
 #import <sys/un.h>
 #import <signal.h>
 #import <mach-o/dyld.h>
+#include <dlfcn.h>
 
 // =============================================================================
 // Constants
@@ -102,6 +103,37 @@ static BOOL isMenuBarDark(void) {
         bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
     [[NSStatusBar systemStatusBar] removeStatusItem:probe];
     return [match isEqualToString:NSAppearanceNameDarkAqua];
+}
+
+static NSColor *sampleMenuBarColor(CGFloat x, CGFloat width) {
+    // Dynamic lookup — CGDisplayCreateImageForRect is removed from macOS 15 headers
+    // but the symbol still exists in the CoreGraphics dylib
+    typedef CGImageRef (*Fn)(CGDirectDisplayID, CGRect);
+    static Fn fn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ fn = dlsym(RTLD_DEFAULT, "CGDisplayCreateImageForRect"); });
+    if (!fn) return nil;
+
+    // Sample a horizontal strip at top of screen (CG coords: Y=0 at top)
+    CGFloat sampleWidth = MIN(width * 0.3, 100);
+    CGRect sampleRect = CGRectMake(x + width * 0.5, 0, sampleWidth, 1);
+    CGImageRef img = fn(CGMainDisplayID(), sampleRect);
+    if (!img) return nil;
+
+    // Draw into a 1x1 bitmap — this averages all pixels automatically
+    uint8_t pixel[4] = {0};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(pixel, 1, 1, 8, 4, cs,
+        (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), img);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    CGImageRelease(img);
+
+    return [NSColor colorWithSRGBRed:pixel[0] / 255.0
+                               green:pixel[1] / 255.0
+                                blue:pixel[2] / 255.0
+                               alpha:1.0];
 }
 
 // =============================================================================
@@ -298,7 +330,7 @@ typedef NS_ENUM(NSInteger, ToastState) {
 @interface ToastController : NSObject
 @property (nonatomic, strong) ToastWindow *window;
 @property (nonatomic, strong) ToastContentView *contentView;
-@property (nonatomic, strong) NSVisualEffectView *vibrancyView;
+@property (nonatomic, strong) CALayer *backgroundLayer;
 @property (nonatomic, strong) NSTimer *durationTimer;
 @property (nonatomic, strong) NSTimer *mousePollingTimer;
 @property (nonatomic, assign) BOOL timerExpired;
@@ -307,6 +339,7 @@ typedef NS_ENUM(NSInteger, ToastState) {
 @property (nonatomic, assign) int serverFD;
 @property (nonatomic, strong) NSFileHandle *serverHandle;
 @property (nonatomic, assign) NSPoint initialMousePosition;
+@property (nonatomic, strong) NSColor *cachedMenuBarColor;
 
 - (void)showToastWithText:(NSString *)text duration:(NSTimeInterval)duration;
 - (void)dismissToast;
@@ -592,11 +625,10 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
     // ---- If toast is already visible, cross-fade the text ----
     BOOL alreadyVisible = (self.state == ToastStateFadingIn || self.state == ToastStateVisible);
     if (alreadyVisible && self.window) {
-        CGFloat contentInset = kLeftFadeWidth;
         [self.window setFrame:windowFrame display:YES];
-        self.vibrancyView.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
-        self.vibrancyView.layer.mask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
-        self.contentView.frame = NSMakeRect(contentInset, 0, toastWidth - contentInset, menuBarHeight);
+        self.backgroundLayer.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.backgroundLayer.mask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.contentView.frame = NSMakeRect(kLeftFadeWidth, 0, toastWidth - kLeftFadeWidth, menuBarHeight);
         self.window.appearance = menuBarAppearance;
 
         // Cancel timers
@@ -662,18 +694,17 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
         self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                           NSWindowCollectionBehaviorStationary;
 
-        // Vibrancy effect view as the content view
-        self.vibrancyView = [[NSVisualEffectView alloc]
-            initWithFrame:NSMakeRect(0, 0, toastWidth, menuBarHeight)];
-        self.vibrancyView.material = NSVisualEffectMaterialMenu;
-        self.vibrancyView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-        self.vibrancyView.state = NSVisualEffectStateActive;
-        self.vibrancyView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        self.vibrancyView.wantsLayer = YES;
+        // Container view (covers entire window)
+        NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, toastWidth, menuBarHeight)];
+        container.wantsLayer = YES;
+        self.window.contentView = container;
 
-        // Left-edge fade mask so vibrancy blends into the real menu bar
+        // Background layer with left-edge fade gradient mask
+        self.backgroundLayer = [CALayer layer];
+        self.backgroundLayer.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+
         CAGradientLayer *fadeMask = [CAGradientLayer layer];
-        fadeMask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        fadeMask.frame = self.backgroundLayer.frame;
         fadeMask.startPoint = CGPointMake(0, 0.5);
         fadeMask.endPoint = CGPointMake(1, 0.5);
         CGFloat fadeWidth = kLeftFadeWidth / toastWidth;
@@ -681,29 +712,28 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
                             (__bridge id)[NSColor blackColor].CGColor,
                             (__bridge id)[NSColor blackColor].CGColor];
         fadeMask.locations = @[@0.0, @(fadeWidth), @1.0];
-        self.vibrancyView.layer.mask = fadeMask;
+        self.backgroundLayer.mask = fadeMask;
+        [container.layer addSublayer:self.backgroundLayer];
 
-        self.window.contentView = self.vibrancyView;
-
-        // Toast content view on top of vibrancy, offset past the fade zone
+        // Content view (text, offset past the fade zone)
         self.contentView = [[ToastContentView alloc]
             initWithFrame:NSMakeRect(kLeftFadeWidth, 0, toastWidth - kLeftFadeWidth, menuBarHeight)];
         self.contentView.controller = self;
-        [self.vibrancyView addSubview:self.contentView];
+        [container addSubview:self.contentView];
 
         self.window.alphaValue = 0.0;
     } else {
-        CGFloat contentInset = kLeftFadeWidth;
         [self.window setFrame:windowFrame display:YES];
-        self.vibrancyView.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
-        self.vibrancyView.layer.mask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
-        self.contentView.frame = NSMakeRect(contentInset, 0, toastWidth - contentInset, menuBarHeight);
+        self.backgroundLayer.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.backgroundLayer.mask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.contentView.frame = NSMakeRect(kLeftFadeWidth, 0, toastWidth - kLeftFadeWidth, menuBarHeight);
     }
 
-    // ---- Set appearance to match menu bar ----
+    // ---- Set background from cached menu bar color ----
     self.window.appearance = menuBarAppearance;
-    self.window.backgroundColor = [NSColor clearColor];
-    self.vibrancyView.hidden = NO;
+    NSColor *bgColor = self.cachedMenuBarColor
+        ?: (dark ? [NSColor blackColor] : [NSColor whiteColor]);
+    self.backgroundLayer.backgroundColor = bgColor.CGColor;
 
     [self.contentView setAttributedText:attrStr maxWidth:toastWidth - kLeftFadeWidth];
 
@@ -841,6 +871,48 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
     }
 }
 
+// ---- Menu bar color sampling (cached across launches via NSUserDefaults) ----
+
+- (void)refreshMenuBarColor {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSScreen *screen = [NSScreen mainScreen];
+
+    // Get current wallpaper identity
+    NSURL *wallpaperURL = [[NSWorkspace sharedWorkspace] desktopImageURLForScreen:screen];
+    NSString *currentWallpaper = wallpaperURL.absoluteString ?: @"";
+    BOOL dark = isMenuBarDark();
+    NSString *cacheKey = [NSString stringWithFormat:@"%@|%d", currentWallpaper, dark];
+
+    // Check if cached color is still valid
+    NSString *storedKey = [defaults stringForKey:@"cachedMenuBarKey"];
+    if ([cacheKey isEqualToString:storedKey]) {
+        CGFloat r = [defaults doubleForKey:@"cachedMenuBarR"];
+        CGFloat g = [defaults doubleForKey:@"cachedMenuBarG"];
+        CGFloat b = [defaults doubleForKey:@"cachedMenuBarB"];
+        self.cachedMenuBarColor = [NSColor colorWithSRGBRed:r green:g blue:b alpha:1.0];
+        return;
+    }
+
+    // Wallpaper changed — re-sample
+    NSRect screenFrame = screen.frame;
+    CGFloat statusLeftEdge = getStatusAreaLeftEdge();
+    CGFloat toastX = statusLeftEdge - kLeftFadeWidth;
+    CGFloat toastWidth = NSMaxX(screenFrame) - toastX;
+
+    NSColor *color = sampleMenuBarColor(toastX, toastWidth);
+    if (color) {
+        self.cachedMenuBarColor = color;
+        // Persist
+        CGFloat r, g, b, a;
+        NSColor *rgb = [color colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+        [rgb getRed:&r green:&g blue:&b alpha:&a];
+        [defaults setObject:cacheKey forKey:@"cachedMenuBarKey"];
+        [defaults setDouble:r forKey:@"cachedMenuBarR"];
+        [defaults setDouble:g forKey:@"cachedMenuBarG"];
+        [defaults setDouble:b forKey:@"cachedMenuBarB"];
+    }
+}
+
 // ---- IPC Server ----
 
 - (void)startServer {
@@ -859,6 +931,9 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
                                                object:self.serverHandle];
 
     [self.serverHandle acceptConnectionInBackgroundAndNotify];
+
+    // Load or sample menu bar color (cached across launches)
+    [self refreshMenuBarColor];
 }
 
 - (void)acceptConnection:(NSNotification *)notification {
