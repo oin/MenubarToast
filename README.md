@@ -40,6 +40,10 @@ make
 
 Requires macOS and Xcode command-line tools.
 
+# Known Issues
+
+- The toast background uses `NSVisualEffectMaterialMenu` which doesn't perfectly match the menu bar's native translucency. A left-edge fade gradient helps blend the transition, but a slight color difference may be visible on some wallpapers.
+
 # Acknowledgements
 
 Built with [Claude Code](https://claude.ai/claude-code).

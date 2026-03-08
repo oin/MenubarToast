@@ -15,7 +15,8 @@ static const CGFloat        kScrollSpeed        = 50.0;   // points/sec
 static const NSTimeInterval kScrollPause        = 1.0;    // pause at each end
 static const NSTimeInterval kScrollPauseStart   = 0.3;    // pause before first scroll
 static const CGFloat        kHorizontalPadding  = 12.0;
-static const NSTimeInterval kMousePollInterval  = 0.05;
+static const CGFloat        kLeftFadeWidth      = 30.0;
+static const NSTimeInterval kMousePollInterval  = 0.1 ;
 
 // =============================================================================
 // Globals
@@ -297,6 +298,7 @@ typedef NS_ENUM(NSInteger, ToastState) {
 @interface ToastController : NSObject
 @property (nonatomic, strong) ToastWindow *window;
 @property (nonatomic, strong) ToastContentView *contentView;
+@property (nonatomic, strong) NSVisualEffectView *vibrancyView;
 @property (nonatomic, strong) NSTimer *durationTimer;
 @property (nonatomic, strong) NSTimer *mousePollingTimer;
 @property (nonatomic, assign) BOOL timerExpired;
@@ -337,6 +339,7 @@ typedef NS_ENUM(NSInteger, ToastState) {
     if (self) {
         self.wantsLayer = YES;
         self.layer.masksToBounds = YES;
+        self.layer.backgroundColor = [NSColor clearColor].CGColor;
 
         _label = [NSTextField labelWithString:@""];
         _label.bezeled = NO;
@@ -557,13 +560,13 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
     // ---- Screen geometry ----
     NSScreen *screen = [NSScreen mainScreen];
     NSRect screenFrame = screen.frame;
-    CGFloat menuBarHeight = NSMaxY(screenFrame) - NSMaxY(screen.visibleFrame);
+    CGFloat menuBarHeight = NSMaxY(screenFrame) - NSMaxY(screen.visibleFrame) - 1;
     if (menuBarHeight < 22) menuBarHeight = 24;
 
     // ---- Toast covers the right status area of the menu bar ----
     CGFloat statusLeftEdge = getStatusAreaLeftEdge();
-    CGFloat toastX = statusLeftEdge;
-    CGFloat toastWidth = NSMaxX(screenFrame) - statusLeftEdge;
+    CGFloat toastX = statusLeftEdge - kLeftFadeWidth;
+    CGFloat toastWidth = NSMaxX(screenFrame) - toastX;
     if (toastWidth < 100) {
         // Fallback if detection fails
         toastX = screenFrame.origin.x;
@@ -589,12 +592,12 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
     // ---- If toast is already visible, cross-fade the text ----
     BOOL alreadyVisible = (self.state == ToastStateFadingIn || self.state == ToastStateVisible);
     if (alreadyVisible && self.window) {
+        CGFloat contentInset = kLeftFadeWidth;
         [self.window setFrame:windowFrame display:YES];
-        self.contentView.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.vibrancyView.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.vibrancyView.layer.mask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.contentView.frame = NSMakeRect(contentInset, 0, toastWidth - contentInset, menuBarHeight);
         self.window.appearance = menuBarAppearance;
-        self.window.backgroundColor = dark
-            ? [NSColor colorWithWhite:0.0 alpha:1.0]
-            : [NSColor colorWithWhite:1.0 alpha:1.0];
 
         // Cancel timers
         [self.durationTimer invalidate];
@@ -615,7 +618,7 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
             self.contentView.label.animator.alphaValue = 0.0;
         } completionHandler:^{
             // Update text content
-            [self.contentView setAttributedText:attrStr maxWidth:toastWidth];
+            [self.contentView setAttributedText:attrStr maxWidth:toastWidth - kLeftFadeWidth];
 
             // Reset state
             self.timerExpired = NO;
@@ -659,24 +662,50 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
         self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                           NSWindowCollectionBehaviorStationary;
 
-        self.contentView = [[ToastContentView alloc]
+        // Vibrancy effect view as the content view
+        self.vibrancyView = [[NSVisualEffectView alloc]
             initWithFrame:NSMakeRect(0, 0, toastWidth, menuBarHeight)];
+        self.vibrancyView.material = NSVisualEffectMaterialMenu;
+        self.vibrancyView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+        self.vibrancyView.state = NSVisualEffectStateActive;
+        self.vibrancyView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        self.vibrancyView.wantsLayer = YES;
+
+        // Left-edge fade mask so vibrancy blends into the real menu bar
+        CAGradientLayer *fadeMask = [CAGradientLayer layer];
+        fadeMask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        fadeMask.startPoint = CGPointMake(0, 0.5);
+        fadeMask.endPoint = CGPointMake(1, 0.5);
+        CGFloat fadeWidth = kLeftFadeWidth / toastWidth;
+        fadeMask.colors = @[(__bridge id)[NSColor clearColor].CGColor,
+                            (__bridge id)[NSColor blackColor].CGColor,
+                            (__bridge id)[NSColor blackColor].CGColor];
+        fadeMask.locations = @[@0.0, @(fadeWidth), @1.0];
+        self.vibrancyView.layer.mask = fadeMask;
+
+        self.window.contentView = self.vibrancyView;
+
+        // Toast content view on top of vibrancy, offset past the fade zone
+        self.contentView = [[ToastContentView alloc]
+            initWithFrame:NSMakeRect(kLeftFadeWidth, 0, toastWidth - kLeftFadeWidth, menuBarHeight)];
         self.contentView.controller = self;
-        self.window.contentView = self.contentView;
+        [self.vibrancyView addSubview:self.contentView];
 
         self.window.alphaValue = 0.0;
     } else {
+        CGFloat contentInset = kLeftFadeWidth;
         [self.window setFrame:windowFrame display:YES];
-        self.contentView.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.vibrancyView.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.vibrancyView.layer.mask.frame = NSMakeRect(0, 0, toastWidth, menuBarHeight);
+        self.contentView.frame = NSMakeRect(contentInset, 0, toastWidth - contentInset, menuBarHeight);
     }
 
-    // ---- Set background color to match menu bar ----
+    // ---- Set appearance to match menu bar ----
     self.window.appearance = menuBarAppearance;
-    self.window.backgroundColor = dark
-        ? [NSColor colorWithWhite:0.0 alpha:1.0]
-        : [NSColor colorWithWhite:1.0 alpha:1.0];
+    self.window.backgroundColor = [NSColor clearColor];
+    self.vibrancyView.hidden = NO;
 
-    [self.contentView setAttributedText:attrStr maxWidth:toastWidth];
+    [self.contentView setAttributedText:attrStr maxWidth:toastWidth - kLeftFadeWidth];
 
     // ---- Duration (extend for scroll if needed) ----
     NSTimeInterval minScrollDuration = [self.contentView minimumScrollDuration];
