@@ -105,6 +105,14 @@ static BOOL isMenuBarDark(void) {
     return [match isEqualToString:NSAppearanceNameDarkAqua];
 }
 
+static BOOL isColorDark(NSColor *color) {
+    NSColor *rgb = [color colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
+    CGFloat r, g, b, a;
+    [rgb getRed:&r green:&g blue:&b alpha:&a];
+    CGFloat luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return luma < 0.5;
+}
+
 static NSColor *sampleMenuBarColor(CGFloat x, CGFloat width) {
     // Dynamic lookup — CGDisplayCreateImageForRect is removed from macOS 15 headers
     // but the symbol still exists in the CoreGraphics dylib
@@ -607,7 +615,12 @@ static BOOL sendMessageToServer(int fd, NSDictionary *message) {
     }
 
     // ---- Detect menu bar appearance ----
-    BOOL dark = isMenuBarDark();
+    // On macOS Tahoe the menu bar's visible color is driven by the wallpaper,
+    // not the system Aqua/DarkAqua appearance — so derive text color from the
+    // sampled background luma when available.
+    BOOL dark = self.cachedMenuBarColor
+        ? isColorDark(self.cachedMenuBarColor)
+        : isMenuBarDark();
     NSAppearance *menuBarAppearance = [NSAppearance appearanceNamed:
         dark ? NSAppearanceNameVibrantDark : NSAppearanceNameVibrantLight];
 
